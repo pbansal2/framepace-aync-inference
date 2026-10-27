@@ -1,0 +1,32 @@
+# Build trees (CMake build dirs, install staging)
+build/
+build-*/
+out/
+install/
+staging/
+
+# CTest / CMake artifacts from an accidental in-source build
+CMakeCache.txt
+CMakeFiles/
+CMakeUserPresets.json
+Testing/
+cmake_install.cmake
+CTestTestfile.cmake
+compile_commands.json
+
+# Build and sanitizer logs
+*.log
+
+# Editor / tooling
+.cache/
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+
+# Private working notes (design log, runbook) -- not published
+docs/
+
+# AI assistant instructions -- local only
+CLAUDE.md

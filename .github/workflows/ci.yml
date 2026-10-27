@@ -1,0 +1,272 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  # Correctness on both SIMD paths: ubuntu-latest is x86_64 (SSSE3 kernel),
+  # macos-14 is arm64 (NEON kernel). The kernels must agree bit for bit, so a
+  # single-arch CI would not catch a divergence.
+  build-and-test:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: "linux-x86_64-gcc",    os: ubuntu-latest, cc: gcc,   cxx: g++ }
+          - { name: "linux-x86_64-clang",  os: ubuntu-latest, cc: clang, cxx: clang++ }
+          - { name: "macos-arm64-clang",   os: macos-14,      cc: clang, cxx: clang++ }
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        env:
+          CC: ${{ matrix.cc }}
+          CXX: ${{ matrix.cxx }}
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DFRAMEPACE_WERROR=ON
+
+      - name: Build
+        run: cmake --build build --config Release -j
+
+      - name: Report active kernel
+        run: ./build/frame_bench --only downsample | grep "kernel in use"
+
+      # Deterministic tests only. test_pacer and test_spsc assert on wall-clock
+      # cadence, which a shared CI runner cannot honour -- see the timing job.
+      - name: Test (deterministic)
+        run: ctest --test-dir build --output-on-failure -E "test_pacer"
+
+      # Non-blocking: these measure real time on a noisy, oversubscribed runner,
+      # so a failure here is evidence about the runner, not necessarily the code.
+      - name: Test (timing-sensitive, advisory)
+        continue-on-error: true
+        run: ctest --test-dir build --output-on-failure -R "test_pacer"
+
+      # The example is what new integrators copy, so it must keep building and
+      # running. It exits non-zero only if the pipeline produced no estimates.
+      - name: Run integration example
+        run: ./build/integration_example --frames 240
+
+  # Geometry is a compile-time option, and the default (1920x1080) can hide
+  # buffer-size bugs that only appear at other resolutions -- a test once
+  # overflowed a heap buffer at 720p and passed at 1080p. Build a non-default
+  # geometry under AddressSanitizer + UBSan so that class of bug fails loudly.
+  non-default-geometry:
+    name: geometry-1280x720-asan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure (1280x720, 64 features, ASan + UBSan)
+        env:
+          CC: clang
+          CXX: clang++
+        run: >
+          cmake -B build -DFRAMEPACE_ENABLE_ASAN=ON -DFRAMEPACE_ENABLE_UBSAN=ON
+          -DFRAMEPACE_SOURCE_WIDTH=1280 -DFRAMEPACE_SOURCE_HEIGHT=720
+          -DFRAMEPACE_MAX_FEATURES=64
+      - name: Build
+        run: cmake --build build -j
+      - name: Test
+        env:
+          UBSAN_OPTIONS: "halt_on_error=1:print_stacktrace=1"
+        run: ctest --test-dir build --output-on-failure -E "test_pacer"
+      - name: Run integration example
+        env:
+          ASAN_OPTIONS: "detect_leaks=0"
+          UBSAN_OPTIONS: "halt_on_error=1:print_stacktrace=1"
+        run: ./build/integration_example --frames 240
+
+  thread-sanitizer:
+    name: thread-sanitizer
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Ubuntu 24.04 runners use vm.mmap_rnd_bits=32, which can collide with
+      # TSan's fixed shadow-memory layout ("FATAL: ThreadSanitizer: unexpected
+      # memory mapping"). 28 bits restores the layout TSan expects.
+      - name: Make ASLR compatible with TSan
+        run: sudo sysctl vm.mmap_rnd_bits=28
+
+      - name: Configure with TSan
+        env:
+          CC: clang
+          CXX: clang++
+        run: cmake -B build-tsan -DFRAMEPACE_ENABLE_TSAN=ON
+
+      - name: Build
+        run: cmake --build build-tsan -j
+
+      # Fail on any race report, not just a non-zero exit: with
+      # halt_on_error=0 the binary can report races and still exit 0.
+      - name: Run all targets and fail on any race
+        env:
+          TSAN_OPTIONS: "halt_on_error=0 history_size=7"
+        run: |
+          races=0
+          for t in test_spsc test_pacer test_downsample test_no_alloc; do
+            ./build-tsan/"$t" > "/tmp/ts-$t.log" 2>&1 || true
+            n=$(grep -c 'WARNING: ThreadSanitizer' "/tmp/ts-$t.log" || true)
+            echo "::group::$t (races=$n)"; cat "/tmp/ts-$t.log"; echo "::endgroup::"
+            races=$((races + n))
+          done
+          echo "total races: $races"
+          test "$races" -eq 0
+
+  # A clean TSan run only proves something if the tests exercise the
+  # synchronisation. Weaken the queue's release store and TSan must complain;
+  # if it does not, the job above is green for the wrong reason.
+  tsan-negative-control:
+    name: tsan-negative-control
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Ubuntu 24.04 runners use vm.mmap_rnd_bits=32, which can collide with
+      # TSan's fixed shadow-memory layout ("FATAL: ThreadSanitizer: unexpected
+      # memory mapping"). 28 bits restores the layout TSan expects.
+      - name: Make ASLR compatible with TSan
+        run: sudo sysctl vm.mmap_rnd_bits=28
+
+      - name: Weaken the release/acquire edge
+        run: |
+          perl -pi -e 's/tail_\.store\(tail \+ 1, std::memory_order_release\)/tail_.store(tail + 1, std::memory_order_relaxed)/g' \
+            include/framepace/spsc_queue.hpp
+          grep -c "memory_order_relaxed" include/framepace/spsc_queue.hpp
+
+      - name: Configure and build with TSan
+        env:
+          CC: clang
+          CXX: clang++
+        run: |
+          cmake -B build-tsan -DFRAMEPACE_ENABLE_TSAN=ON
+          cmake --build build-tsan --target test_spsc -j
+
+      - name: Expect races (exact count varies with interleaving)
+        env:
+          TSAN_OPTIONS: "halt_on_error=0 history_size=7"
+        run: |
+          ./build-tsan/test_spsc > /tmp/neg.log 2>&1 || true
+          n=$(grep -c 'WARNING: ThreadSanitizer' /tmp/neg.log || true)
+          echo "races with weakened ordering: $n"
+          test "$n" -gt 0
+
+  zero-allocation:
+    name: zero-allocation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure and build
+        env:
+          CC: clang
+          CXX: clang++
+        run: |
+          cmake -B build -DCMAKE_BUILD_TYPE=Release -DFRAMEPACE_WERROR=ON
+          cmake --build build --target test_no_alloc -j
+      - name: Assert zero hot-path allocations
+        run: |
+          ./build/test_no_alloc | tee /tmp/alloc.log
+          grep -q "hot-path allocations: 0 " /tmp/alloc.log
+
+  # Guards the one formatting hazard that silently changes a benchmark result:
+  # clang-format can relocate the pragma that keeps the scalar downsample a
+  # genuine (non-vectorised) baseline.
+  format:
+    name: format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Pinned: formatting output changes between clang-format major versions,
+      # and apt on ubuntu-latest ships an older major than the repo was
+      # formatted with. Unpinned, this job fails on files nobody touched.
+      - name: Install clang-format (pinned)
+        run: |
+          pip install --user "clang-format==22.*"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Configure
+        run: |
+          clang-format --version
+          cmake -B build -DCMAKE_BUILD_TYPE=Release -DCLANG_FORMAT_EXE="$(command -v clang-format)"
+      - name: Check formatting
+        run: cmake --build build --target format-check
+      - name: Confirm the vectorize-disable pragma survived
+        run: grep -q "vectorize(disable)" src/downsample.cpp
+
+  # The library must stay usable as a dependency, not just as a standalone
+  # build: tests/benchmarks off, no target-name or ctest pollution, and the
+  # namespaced alias present.
+  consumability:
+    name: consumability
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: framepace
+
+      - name: Consume via add_subdirectory
+        run: |
+          mkdir -p consumer/app
+          cd consumer
+          # A 'format' target here on purpose: it used to collide with ours.
+          cat > CMakeLists.txt <<'EOF'
+          cmake_minimum_required(VERSION 3.20)
+          project(consumer LANGUAGES CXX)
+          enable_testing()
+          add_custom_target(format COMMAND ${CMAKE_COMMAND} -E echo "consumer format")
+          add_subdirectory(../framepace framepace)
+          add_executable(app app/main.cpp)
+          target_link_libraries(app PRIVATE framepace::framepace)
+          EOF
+          # The C-style cast is deliberate. framepace builds itself with
+          # -Wold-style-cast, and configuring it with FRAMEPACE_WERROR=ON
+          # below would make that cast a hard error if framepace's warning
+          # flags leaked into consumer code. They must not.
+          cat > app/main.cpp <<'EOF'
+          #include "framepace/pacer.hpp"
+          #include <cstdio>
+          int main() {
+            framepace::Pacer::Config cfg;
+            double ms = framepace::to_ms(cfg.frame_budget);
+            std::printf("budget=%d ms\n", (int)ms);
+            return 0;
+          }
+          EOF
+          cmake -B build -DFRAMEPACE_WERROR=ON
+          cmake --build build -j
+          ./build/app
+          # framepace must not have added its tests to the consumer's ctest.
+          test "$(ctest --test-dir build -N | grep -c 'Test *#')" -eq 0
+
+      - name: Consume via find_package after install
+        run: |
+          cd framepace
+          cmake -B build-inst -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="$PWD/../staging" \
+            -DFRAMEPACE_BUILD_TESTS=OFF -DFRAMEPACE_BUILD_BENCHMARKS=OFF
+          cmake --build build-inst -j
+          cmake --install build-inst
+          cd ..
+          mkdir -p found/app && cd found
+          cat > CMakeLists.txt <<'EOF'
+          cmake_minimum_required(VERSION 3.20)
+          project(found LANGUAGES CXX)
+          find_package(framepace REQUIRED)
+          add_executable(app app/main.cpp)
+          target_link_libraries(app PRIVATE framepace::framepace)
+          EOF
+          cat > app/main.cpp <<'EOF'
+          #include "framepace/spsc_queue.hpp"
+          #include <cstdio>
+          int main() {
+            framepace::SpscQueue<int, 4> q;
+            std::printf("push=%d size=%zu\n", q.try_push(7), q.size());
+            return 0;
+          }
+          EOF
+          cmake -B build -DCMAKE_PREFIX_PATH="$PWD/../staging"
+          cmake --build build -j
+          ./build/app

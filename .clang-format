@@ -1,0 +1,18 @@
+---
+Language: Cpp
+BasedOnStyle: Google
+Standard: c++17
+ColumnLimit: 88
+IndentWidth: 2
+AccessModifierOffset: -1
+DerivePointerAlignment: false
+PointerAlignment: Left
+AllowShortFunctionsOnASingleLine: Inline
+AlwaysBreakTemplateDeclarations: Yes
+IncludeBlocks: Preserve
+SortIncludes: CaseSensitive
+# Keep the intent-bearing comments in the hot-path headers readable rather than
+# letting clang-format rewrap them into one long line.
+ReflowComments: true
+SpaceAfterTemplateKeyword: false
+---

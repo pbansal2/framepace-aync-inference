@@ -1,0 +1,8 @@
+# Normalise line endings in the repository to LF. Without this, a Windows
+# checkout with core.autocrlf rewrites every file to CRLF and the CI
+# format-check job fails on files nobody edited.
+* text=auto eol=lf
+
+# Shell-adjacent files must stay LF even on Windows, or they fail to execute.
+*.sh   text eol=lf
+*.yml  text eol=lf
